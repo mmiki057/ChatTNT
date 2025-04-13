@@ -1,13 +1,8 @@
-# Main dependencies
 pyrogram>=2.0.0
-tgcrypto  # Recommended for Pyrogram for faster encryption
+tgcrypto 
 python-dotenv>=0.19.0
 requests>=2.27.0
-
-# Utilities
 uuid>=1.30
-asyncio>=3.4.3  # Though it's built-in for Python 3.4+
-
-
-# System interaction
-subprocess32>=3.5.4  # Optional, as subprocess is built-in
+asyncio>=3.4.3
+subprocess32>=3.5.4
+openai

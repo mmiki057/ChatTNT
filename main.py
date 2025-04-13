@@ -188,6 +188,71 @@ def get_audio_duration(file_path):
         # Если ошибка, возвращаем большое значение, чтобы разделить файл
         return MAX_SEGMENT_LENGTH_SEC + 1
 
+def load_user_prompts():
+    if os.path.exists(PROMPTS_FILE):
+        try:
+            with open(PROMPTS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+                # Обновляем формат данных для совместимости со старыми версиями
+                # Если в данных хранятся просто строки, преобразуем их в новый формат
+                for username, prompt_data in data.items():
+                    if isinstance(prompt_data, str):
+                        data[username] = {
+                            "current": prompt_data,
+                            "history": [prompt_data]
+                        }
+                return data
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке промптов: {e}")
+    return {}
+
+# Функция для добавления нового промпта пользователю
+def add_user_prompt(username, prompt_text):
+    if username not in user_prompts:
+        user_prompts[username] = {
+            "current": DEFAULT_PROMPT,
+            "history": [DEFAULT_PROMPT]
+        }
+    
+    # Устанавливаем новый промпт как текущий
+    user_prompts[username]["current"] = prompt_text
+    
+    # Добавляем в историю, если такого еще нет
+    if prompt_text not in user_prompts[username]["history"]:
+        user_prompts[username]["history"].append(prompt_text)
+        # Ограничиваем историю 10 последними промптами
+        if len(user_prompts[username]["history"]) > 10:
+            user_prompts[username]["history"] = user_prompts[username]["history"][-10:]
+    
+    # Сохраняем изменения
+    save_user_prompts(user_prompts)
+
+# Функция для получения текущего промпта пользователя
+def get_user_prompt(username):
+    if username in user_prompts:
+        if isinstance(user_prompts[username], str):
+            # Поддержка старого формата
+            return user_prompts[username]
+        return user_prompts[username].get("current", DEFAULT_PROMPT)
+    return DEFAULT_PROMPT
+
+# Функция для получения истории промптов пользователя
+def get_user_prompt_history(username):
+    if username in user_prompts:
+        if isinstance(user_prompts[username], str):
+            # Поддержка старого формата
+            return [user_prompts[username]]
+        return user_prompts[username].get("history", [DEFAULT_PROMPT])
+    return [DEFAULT_PROMPT]
+
+# Добавляем состояние для отслеживания ввода промпта
+def set_awaiting_prompt(username, value=True):
+    set_state(username, "awaiting_prompt", value)
+
+def is_awaiting_prompt(username):
+    return get_state(username).get("awaiting_prompt", False)
+
 def split_audio_file(file_path: str) -> List[str]:
     """
     Разделяет аудиофайл на сегменты по 2 минуты с помощью ffmpeg
@@ -638,7 +703,6 @@ async def show_language_selection(message: Message, file_path: str) -> None:
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# Обработчик для кнопок выбора языка
 @app.on_callback_query(filters.regex(r"^lang_(.+)$"))
 async def handle_language_selection(client, callback_query):
     try:
@@ -686,8 +750,7 @@ async def handle_language_selection(client, callback_query):
             set_state(username, "transcription", transcription)
             
             # Предлагаем пользователю выбор действий с транскрипцией
-            # В функции handle_language_selection меняем код создания клавиатуры:
-            # Предлагаем пользователю выбор действий с транскрипцией
+            # ИЗМЕНЕНО: Убрали кнопку "Изменить промпт" из основного меню
             keyboard = [
                 [InlineKeyboardButton("📝 Показать транскрипцию", callback_data="action_show_transcription")],
                 [InlineKeyboardButton("🧠 Обработать через ChatGPT", callback_data="action_process_gpt")],
@@ -721,7 +784,8 @@ async def handle_language_selection(client, callback_query):
         clear_state(username, "file_path")
         clear_state(username, "language")
 
-# Обработчик кнопок действий с транскрипцией
+# Обновляем обработчик кнопок действий с транскрипцией
+# Обновляем обработчик кнопок действий с транскрипцией
 @app.on_callback_query(filters.regex(r"^action_(.+)$"))
 async def handle_action_selection(client, callback_query):
     try:
@@ -786,65 +850,28 @@ async def handle_action_selection(client, callback_query):
                 )
                 return
             
-            await callback_query.answer("Отправляю в ChatGPT")
+            await callback_query.answer("Подготовка к обработке")
             
-            # Получаем промпт пользователя или используем промпт по умолчанию
-            prompt = user_prompts.get(username, DEFAULT_PROMPT)
+            # Получаем промпт пользователя с новой функцией
+            prompt = get_user_prompt(username)
             
-            # Обновляем статус
+            # Сохраняем транскрипцию для последующей обработки
+            set_state(username, "pending_transcription", transcription)
+            
+            # Показываем текущий промпт и предлагаем его изменить
+            keyboard = [
+                [InlineKeyboardButton("✏️ Изменить промпт", callback_data="change_prompt")],
+                [InlineKeyboardButton("✅ Отправить на обработку", callback_data="confirm_gpt_process")],
+                [InlineKeyboardButton("🔙 Назад", callback_data="back_to_actions")]
+            ]
+            
             await callback_query.message.edit_text(
-                "🧠 Обрабатываю текст с помощью ChatGPT...",
-                reply_markup=None
-            )
-            
-            # Отправляем текст на обработку в ChatGPT
-            try:
-                if not openai_client:
-                    result = "❌ Ошибка: API ключ OpenAI не настроен в конфигурации бота."
-                else:
-                    response = openai_client.chat.completions.create(
-                        model="gpt-3.5-turbo",
-                        messages=[
-                            {"role": "system", "content": prompt},
-                            {"role": "user", "content": transcription}
-                        ],
-                        temperature=0.7,
-                        max_tokens=2000
-                    )
-                    result = response.choices[0].message.content
-            except Exception as e:
-                logger.error(f"Ошибка при вызове ChatGPT API: {e}", exc_info=True)
-                result = f"Ошибка при обработке текста: {str(e)}"
-            
-            # Разбиваем результат на страницы, как и для транскрипции
-            page_size = 3000
-            pages = [result[i:i+page_size] for i in range(0, len(result), page_size)]
-            total_pages = len(pages)
-            
-            # Сохраняем информацию о страницах в состоянии пользователя
-            set_state(username, "gpt_result_pages", pages)
-            set_state(username, "current_gpt_page", 0)
-            
-            # Создаем клавиатуру с навигацией по страницам
-            keyboard = []
-            
-            # Если страниц больше одной, добавляем кнопки навигации
-            if total_pages > 1:
-                nav_buttons = []
-                nav_buttons.append(InlineKeyboardButton("◀️", callback_data="gpt_page_prev"))
-                nav_buttons.append(InlineKeyboardButton(f"1/{total_pages}", callback_data="gpt_page_info"))
-                nav_buttons.append(InlineKeyboardButton("▶️", callback_data="gpt_page_next"))
-                keyboard.append(nav_buttons)
-            
-            # Добавляем кнопку "Назад"
-            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_actions")])
-            
-            # Показываем первую страницу результата
-            await callback_query.message.edit_text(
-                f"🧠 **Результат обработки ChatGPT** (страница 1/{total_pages}):\n\n{pages[0]}",
+                "🧠 **Подготовка к обработке через ChatGPT**\n\n"
+                f"📝 **Ваш текущий промпт:**\n`{prompt}`\n\n"
+                "Хотите изменить промпт или отправить текст на обработку с текущим промптом?",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-        
+            
     except Exception as e:
         logger.error(f"Ошибка при обработке действия: {e}", exc_info=True)
         await callback_query.answer(f"Произошла ошибка: {str(e)}")
@@ -914,12 +941,11 @@ async def reset_prompt_command(client, message):
 async def start_command(client, message):
     username = message.from_user.username or str(message.from_user.id)
     
-    # Получаем текущий промпт пользователя или дефолтный
-    current_prompt = user_prompts.get(username, DEFAULT_PROMPT)
+    # Получаем текущий промпт пользователя с правильной функцией
+    current_prompt = get_user_prompt(username)
     
     # Создаем клавиатуру для главного меню
     keyboard = [
-        [InlineKeyboardButton("📝 Изменить промпт", callback_data="change_prompt")],
         [InlineKeyboardButton("❓ Помощь", callback_data="show_help")]
     ]
     
@@ -1100,45 +1126,246 @@ async def handle_audio(client, message):
         # Очистка статуса пользователя в случае ошибки
         clear_state(username, "transcribing")
 
+@app.on_callback_query(filters.regex(r"^change_prompt$"))
+async def change_prompt_callback(client, callback_query):
+    try:
+        username = callback_query.from_user.username or str(callback_query.from_user.id)
+        
+        # Получаем текущий промпт и историю промптов
+        current_prompt = get_user_prompt(username)
+        prompt_history = get_user_prompt_history(username)
+        
+        # Создаем клавиатуру с историей промптов и новыми действиями
+        keyboard = []
+        
+        # Добавляем кнопку для создания нового промпта
+        keyboard.append([InlineKeyboardButton("✏️ Ввести новый промпт", callback_data="input_new_prompt")])
+        
+        # Добавляем историю промптов
+        for i, prompt in enumerate(prompt_history):
+            # Сокращаем длинные промпты для отображения на кнопках
+            short_prompt = prompt[:30] + "..." if len(prompt) > 30 else prompt
+            keyboard.append([InlineKeyboardButton(f"🔄 {short_prompt}", callback_data=f"select_prompt_{i}")])
+        
+        # Добавляем кнопку для сброса к промпту по умолчанию
+        keyboard.append([InlineKeyboardButton("🔄 Сбросить к стандартному", callback_data="reset_prompt")])
+        
+        # Добавляем кнопку "Назад"
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_gpt_prompt")])
+        
+        # Редактируем текущее сообщение
+        await callback_query.message.edit_text(
+            "📝 **Управление промптами для ChatGPT**\n\n"
+            f"**Текущий промпт:**\n`{current_prompt}`\n\n"
+            "Выберите действие:\n"
+            "• Ввести новый промпт\n"
+            "• Выбрать из истории промптов\n"
+            "• Сбросить к стандартному промпту",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        # Подтверждаем нажатие кнопки
+        await callback_query.answer("Открываю управление промптами")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке изменения промпта: {e}", exc_info=True)
+        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+
+
+@app.on_callback_query(filters.regex(r"^input_new_prompt$"))
+async def input_new_prompt_callback(client, callback_query):
+    try:
+        username = callback_query.from_user.username or str(callback_query.from_user.id)
+        
+        # Устанавливаем флаг ожидания ввода промпта
+        set_awaiting_prompt(username)
+        
+        # Редактируем сообщение
+        await callback_query.message.edit_text(
+            "📝 **Ввод нового промпта**\n\n"
+            "Пожалуйста, отправьте текст вашего нового промпта в следующем сообщении.\n\n"
+            "Промпт - это инструкция для ChatGPT, определяющая, как он должен обработать ваш текст.\n"
+            "Например:\n"
+            "• `Суммируй этот текст кратко, выделяя ключевые моменты.`\n"
+            "• `Преобразуй этот транскрипт в четкий конспект с заголовками.`\n"
+            "• `Извлеки из текста список действий и задач.`",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Отменить", callback_data="back_to_gpt_prompt")]
+            ])
+        )
+        
+        # Подтверждаем нажатие кнопки
+        await callback_query.answer("Введите новый промпт")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при вводе нового промпта: {e}", exc_info=True)
+        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+
+# Добавляем новый обработчик для возврата к промпту ChatGPT
+@app.on_callback_query(filters.regex(r"^back_to_gpt_prompt$"))
+async def back_to_gpt_prompt(client, callback_query):
+    try:
+        username = callback_query.from_user.username or str(callback_query.from_user.id)
+        
+        # Сбрасываем флаг ожидания промпта, если он был установлен
+        set_awaiting_prompt(username, False)
+        
+        # Получаем сохраненную транскрипцию
+        transcription = get_state(username).get("pending_transcription")
+        
+        if not transcription:
+            # Если транскрипция не найдена, возвращаемся к основному меню действий
+            await callback_query.answer("Возвращаюсь к основному меню")
+            return await back_to_actions_callback(client, callback_query)
+        
+        # Получаем промпт пользователя с новой функцией
+        prompt = get_user_prompt(username)
+        
+        # Создаем клавиатуру
+        keyboard = [
+            [InlineKeyboardButton("✏️ Изменить промпт", callback_data="change_prompt")],
+            [InlineKeyboardButton("✅ Отправить на обработку", callback_data="confirm_gpt_process")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_actions")]
+        ]
+        
+        # Редактируем сообщение
+        await callback_query.message.edit_text(
+            "🧠 **Подготовка к обработке через ChatGPT**\n\n"
+            f"📝 **Ваш текущий промпт:**\n`{prompt}`\n\n"
+            "Хотите изменить промпт или отправить текст на обработку с текущим промптом?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        # Подтверждаем нажатие кнопки
+        await callback_query.answer("Вернулся к настройкам обработки")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при возврате к настройкам обработки: {e}", exc_info=True)
+        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        
+        # В случае ошибки возвращаемся к основному меню
+        await back_to_actions_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex(r"^select_prompt_(\d+)$"))
+async def select_prompt_callback(client, callback_query):
+    try:
+        username = callback_query.from_user.username or str(callback_query.from_user.id)
+        
+        # Получаем индекс выбранного промпта
+        prompt_index = int(callback_query.data.split("_")[2])
+        
+        # Получаем историю промптов
+        prompt_history = get_user_prompt_history(username)
+        
+        # Проверяем, что индекс в пределах списка
+        if 0 <= prompt_index < len(prompt_history):
+            selected_prompt = prompt_history[prompt_index]
+            
+            # Устанавливаем выбранный промпт как текущий
+            if username in user_prompts and isinstance(user_prompts[username], dict):
+                user_prompts[username]["current"] = selected_prompt
+            else:
+                # Совместимость со старым форматом
+                user_prompts[username] = {
+                    "current": selected_prompt,
+                    "history": prompt_history
+                }
+                
+            # Сохраняем изменения
+            save_user_prompts(user_prompts)
+            
+            # Возвращаемся к экрану подготовки к обработке
+            await back_to_gpt_prompt(client, callback_query)
+            
+            # Подтверждаем выбор
+            await callback_query.answer("Промпт выбран")
+        else:
+            await callback_query.answer("Промпт не найден")
+            
+    except Exception as e:
+        logger.error(f"Ошибка при выборе промпта: {e}", exc_info=True)
+        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+
+@app.on_callback_query(filters.regex(r"^reset_prompt$"))
+async def reset_prompt_callback(client, callback_query):
+    try:
+        username = callback_query.from_user.username or str(callback_query.from_user.id)
+        
+        # Устанавливаем промпт по умолчанию как текущий
+        if username in user_prompts:
+            if isinstance(user_prompts[username], dict):
+                user_prompts[username]["current"] = DEFAULT_PROMPT
+                # Добавляем в историю, если его там нет
+                if DEFAULT_PROMPT not in user_prompts[username]["history"]:
+                    user_prompts[username]["history"].append(DEFAULT_PROMPT)
+            else:
+                # Совместимость со старым форматом
+                user_prompts[username] = {
+                    "current": DEFAULT_PROMPT,
+                    "history": [DEFAULT_PROMPT]
+                }
+                
+            # Сохраняем изменения
+            save_user_prompts(user_prompts)
+        
+        # Возвращаемся к экрану подготовки к обработке
+        await back_to_gpt_prompt(client, callback_query)
+        
+        # Подтверждаем сброс
+        await callback_query.answer("Промпт сброшен к стандартному")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при сбросе промпта: {e}", exc_info=True)
+        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+
+# Найдите и удалите одну из двух функций handle_text, оставив только эту обновленную версию:
+
+# Обновляем обработчик текстовых сообщений для добавления кнопки немедленной обработки
 @app.on_message(filters.text)
 async def handle_text(client, message):
     # Пропускаем сообщения с командами
     if message.text.startswith('/'):
         return
     
+    # Получаем username
+    username = message.from_user.username or str(message.from_user.id)
+    
+    # Проверяем, ожидается ли ввод промпта
+    if is_awaiting_prompt(username):
+        # Сохраняем новый промпт
+        new_prompt = message.text
+        add_user_prompt(username, new_prompt)
+        
+        # Сбрасываем флаг ожидания промпта
+        set_awaiting_prompt(username, False)
+        
+        # Получаем текущую транскрипцию, которая ожидает обработки
+        pending_transcription = get_state(username).get("pending_transcription")
+        
+        # Создаем клавиатуру с кнопками
+        keyboard = []
+        
+        # Добавляем кнопку для немедленной обработки через ChatGPT, если есть ожидающая транскрипция
+        if pending_transcription:
+            keyboard.append([InlineKeyboardButton("✅ Отправить на обработку", callback_data="confirm_gpt_process")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Вернуться к ChatGPT", callback_data="back_to_gpt_prompt")])
+        
+        # Отправляем подтверждение
+        await message.reply(
+            f"✅ Ваш промпт успешно сохранен!\n\n"
+            f"📝 **Новый промпт:**\n`{new_prompt}`\n\n"
+            + ("Вы можете сразу отправить текст на обработку с новым промптом или вернуться к экрану выбора." 
+               if pending_transcription else "Теперь вы можете вернуться к обработке через ChatGPT."),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
+    # Если не ожидается ввод промпта, отправляем стандартное сообщение
     await message.reply(
         "Пожалуйста, отправьте мне голосовое сообщение или аудиофайл для транскрипции.\n"
         "Используйте /help для получения справки или /languages для списка поддерживаемых языков."
     )
-
-@app.on_callback_query(filters.regex(r"^change_prompt$"))
-async def change_prompt_callback(client, callback_query):
-    try:
-        username = callback_query.from_user.username or str(callback_query.from_user.id)
-        
-        # Создаем клавиатуру с кнопкой "Назад"
-        keyboard = [
-            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
-        ]
-        
-        # Редактируем текущее сообщение
-        await callback_query.message.edit_text(
-            "📝 **Изменение промпта для ChatGPT**\n\n"
-            "Чтобы установить новый промпт, отправьте команду:\n"
-            "`/setprompt Ваш новый промпт`\n\n"
-            "Например:\n"
-            "`/setprompt Выдели ключевые моменты и сделай краткий конспект по этому тексту.`\n\n"
-            "Чтобы вернуться к стандартному промпту, используйте команду:\n"
-            "`/resetprompt`",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        
-        # Подтверждаем нажатие кнопки
-        await callback_query.answer("Открываю настройки промпта")
-        
-    except Exception as e:
-        logger.error(f"Ошибка при обработке изменения промпта: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
 
 @app.on_callback_query(filters.regex(r"^show_help$"))
 async def show_help_callback(client, callback_query):
@@ -1184,12 +1411,11 @@ async def back_to_main_callback(client, callback_query):
     try:
         username = callback_query.from_user.username or str(callback_query.from_user.id)
         
-        # Получаем текущий промпт пользователя или дефолтный
-        current_prompt = user_prompts.get(username, DEFAULT_PROMPT)
+        # Получаем текущий промпт пользователя с правильной функцией
+        current_prompt = get_user_prompt(username)
         
         # Создаем клавиатуру для главного меню
         keyboard = [
-            [InlineKeyboardButton("📝 Изменить промпт", callback_data="change_prompt")],
             [InlineKeyboardButton("❓ Помощь", callback_data="show_help")]
         ]
         
@@ -1211,7 +1437,7 @@ async def back_to_main_callback(client, callback_query):
     except Exception as e:
         logger.error(f"Ошибка при возврате в главное меню: {e}", exc_info=True)
         await callback_query.answer(f"Произошла ошибка: {str(e)}")
-
+        
 @app.on_callback_query(filters.regex(r"^back_to_language$"))
 async def back_to_language_callback(client, callback_query):
     try:
@@ -1295,7 +1521,7 @@ async def back_to_actions_callback(client, callback_query):
             )
             return
         
-        # Создаем клавиатуру с действиями заново
+        # ИЗМЕНЕНО: Удалена кнопка "Изменить промпт" из основного меню действий
         keyboard = [
             [InlineKeyboardButton("📝 Показать транскрипцию", callback_data="action_show_transcription")],
             [InlineKeyboardButton("🧠 Обработать через ChatGPT", callback_data="action_process_gpt")],
@@ -1447,6 +1673,97 @@ async def handle_gpt_pagination(client, callback_query):
     except Exception as e:
         logger.error(f"Ошибка при навигации по страницам ChatGPT: {e}", exc_info=True)
         await callback_query.answer(f"Произошла ошибка: {str(e)}")
+
+@app.on_callback_query(filters.regex(r"^confirm_gpt_process$"))
+async def confirm_gpt_process(client, callback_query):
+    try:
+        username = callback_query.from_user.username or str(callback_query.from_user.id)
+        
+        # Получаем сохраненную транскрипцию
+        transcription = get_state(username).get("pending_transcription")
+        
+        if not transcription:
+            await callback_query.answer("Транскрипция не найдена")
+            await callback_query.message.edit_text(
+                "❌ Транскрипция не найдена или устарела. Пожалуйста, загрузите файл заново.",
+                reply_markup=None
+            )
+            return
+        
+        # Получаем промпт пользователя с новой функцией
+        prompt = get_user_prompt(username)
+        
+        # Обновляем статус
+        await callback_query.message.edit_text(
+            "🧠 Обрабатываю текст с помощью ChatGPT...",
+            reply_markup=None
+        )
+        
+        # Отправляем текст на обработку в ChatGPT
+        try:
+            if not openai_client:
+                result = "❌ Ошибка: API ключ OpenAI не настроен в конфигурации бота."
+            else:
+                response = openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": transcription}
+                    ],
+                    temperature=0.7,
+                    max_tokens=2000
+                )
+                result = response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Ошибка при вызове ChatGPT API: {e}", exc_info=True)
+            result = f"Ошибка при обработке текста: {str(e)}"
+        
+        # Разбиваем результат на страницы
+        page_size = 3000
+        pages = [result[i:i+page_size] for i in range(0, len(result), page_size)]
+        total_pages = len(pages)
+        
+        # Сохраняем информацию о страницах в состоянии пользователя
+        set_state(username, "gpt_result_pages", pages)
+        set_state(username, "current_gpt_page", 0)
+        
+        # Очищаем временную транскрипцию
+        clear_state(username, "pending_transcription")
+        
+        # Создаем клавиатуру с навигацией по страницам
+        keyboard = []
+        
+        # Если страниц больше одной, добавляем кнопки навигации
+        if total_pages > 1:
+            nav_buttons = []
+            nav_buttons.append(InlineKeyboardButton("◀️", callback_data="gpt_page_prev"))
+            nav_buttons.append(InlineKeyboardButton(f"1/{total_pages}", callback_data="gpt_page_info"))
+            nav_buttons.append(InlineKeyboardButton("▶️", callback_data="gpt_page_next"))
+            keyboard.append(nav_buttons)
+        
+        # Добавляем кнопку "Назад"
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_actions")])
+        
+        # Показываем первую страницу результата
+        await callback_query.message.edit_text(
+            f"🧠 **Результат обработки ChatGPT** (страница 1/{total_pages}):\n\n{pages[0]}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        # Подтверждаем нажатие кнопки
+        await callback_query.answer("Обработка завершена")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке текста через ChatGPT: {e}", exc_info=True)
+        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        
+        # В случае ошибки добавляем кнопку для возврата
+        await callback_query.message.edit_text(
+            f"❌ Произошла ошибка при обработке текста: {str(e)}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад", callback_data="back_to_actions")]
+            ])
+        )
 
 # Запуск бота
 if __name__ == "__main__":
