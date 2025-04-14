@@ -76,16 +76,6 @@ SUPPORTED_LANGUAGES = {
     "en": "Английский🇬🇧",
 }
 
-# Загрузка пользовательских промптов из файла
-def load_user_prompts():
-    if os.path.exists(PROMPTS_FILE):
-        try:
-            with open(PROMPTS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Ошибка при загрузке промптов: {e}")
-    return {}
-
 # Сохранение пользовательских промптов в файл
 def save_user_prompts(prompts):
     try:
@@ -93,9 +83,6 @@ def save_user_prompts(prompts):
             json.dump(prompts, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"Ошибка при сохранении промптов: {e}")
-
-# Инициализация промптов при запуске
-user_prompts = load_user_prompts()
 
 # Хранение состояний пользователей
 user_states = {}
@@ -170,6 +157,27 @@ def clear_state(username: str, key: str = None) -> None:
         else:
             user_states[username] = {}
 
+async def handle_callback_error(callback_query, error_message, return_callback=None):
+    """
+    Стандартная обработка ошибок для callback-запросов
+    
+    Args:
+        callback_query: Callback-запрос
+        error_message: Сообщение об ошибке
+        return_callback: Callback для возврата в предыдущее меню
+    """
+    logger.error(f"Ошибка обработки callback: {error_message}")
+    await callback_query.answer(f"Произошла ошибка: {str(error_message)}")
+    
+    # Добавляем кнопку возврата, если указан callback
+    if return_callback:
+        await callback_query.message.edit_text(
+            f"❌ Произошла ошибка: {str(error_message)}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад", callback_data=return_callback)]
+            ])
+        )
+
 def get_audio_duration(file_path):
     """Получает длительность аудиофайла в секундах с помощью ffprobe"""
     try:
@@ -207,6 +215,42 @@ def load_user_prompts():
             logger.error(f"Ошибка при загрузке промптов: {e}")
     return {}
 
+# Инициализация промптов при запуске
+user_prompts = load_user_prompts()
+
+async def redirect_to_main_menu(callback_query, error_message="Произошла ошибка"):
+    """
+    Перенаправляет пользователя на главную страницу с выводом ошибки во всплывающем сообщении
+    
+    Args:
+        callback_query: Callback-запрос
+        error_message: Сообщение об ошибке для всплывающего окна
+    """
+    username = callback_query.from_user.username or str(callback_query.from_user.id)
+    
+    # Показываем всплывающее сообщение с ошибкой
+    await callback_query.answer(error_message)
+    
+    # Получаем текущий промпт пользователя
+    current_prompt = get_user_prompt(username)
+    
+    # Создаем клавиатуру для главного меню
+    keyboard = [
+        [InlineKeyboardButton("❓ Помощь", callback_data="show_help")]
+    ]
+    
+    # Редактируем сообщение на главную страницу
+    await callback_query.message.edit_text(
+        "👋 Привет! Я бот для транскрипции аудио с возможностью обработки результата через ChatGPT.\n\n"
+        "📱 **Что я умею:**\n"
+        "• Автоматически определять язык аудио\n"
+        "• Переводить текст на разные языки\n"
+        "• Обрабатывать полученный текст через ChatGPT с вашим промптом\n\n"
+        "🎧 Отправьте мне голосовое сообщение или аудиофайл, чтобы начать.\n\n"
+        f"📝 **Ваш текущий промпт для ChatGPT:**\n`{current_prompt}`",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
 # Функция для добавления нового промпта пользователю
 def add_user_prompt(username, prompt_text):
     if username not in user_prompts:
@@ -256,55 +300,35 @@ def is_awaiting_prompt(username):
 def split_audio_file(file_path: str) -> List[str]:
     """
     Разделяет аудиофайл на сегменты по 2 минуты с помощью ffmpeg
-    с перекодированием для обеспечения совместимости
-    
-    Args:
-        file_path: Путь к исходному аудиофайлу
-        
-    Returns:
-        List[str]: Список путей к созданным сегментам
     """
     try:
         print(f"Разделение аудиофайла: {file_path}")
         
-        # Получаем длительность аудио
+        # Получаем длительность аудио и конвертируем в MP3 для совместимости
         duration_sec = get_audio_duration(file_path)
+        converted_path = os.path.join(AUDIO_FILES_DIR, f"{uuid.uuid4()}.mp3")
         
-        # Проверка, что файл не поврежден и имеет длительность
-        if duration_sec <= 0:
-            print("Файл поврежден или имеет нулевую длительность")
-            # Конвертируем в MP3 для исправления возможных ошибок
-            converted_path = os.path.join(AUDIO_FILES_DIR, f"{uuid.uuid4()}.mp3")
-            convert_cmd = [
-                "ffmpeg",
-                "-i", file_path,
-                "-c:a", "libmp3lame",
-                "-q:a", "4",
-                converted_path
-            ]
-            subprocess.run(convert_cmd, capture_output=True)
+        # Конвертируем в MP3 независимо от длительности для обеспечения совместимости
+        convert_cmd = [
+            "ffmpeg",
+            "-i", file_path,
+            "-c:a", "libmp3lame",
+            "-q:a", "4",
+            converted_path
+        ]
+        subprocess.run(convert_cmd, capture_output=True)
+        
+        # Если конвертация не удалась, возвращаем исходный файл
+        if not os.path.exists(converted_path) or os.path.getsize(converted_path) == 0:
+            print("Конвертация не удалась, используем исходный файл")
+            return [file_path]
             
-            # Получаем длительность конвертированного файла
-            duration_sec = get_audio_duration(converted_path)
-            file_path = converted_path
-        
-        # Если файл меньше 2 минут, конвертируем в MP3 и возвращаем
+        # Если файл меньше 2 минут, возвращаем конвертированный файл
         if duration_sec <= MAX_SEGMENT_LENGTH_SEC:
-            # Конвертируем в MP3 для обеспечения совместимости
-            converted_path = os.path.join(AUDIO_FILES_DIR, f"{uuid.uuid4()}.mp3")
-            convert_cmd = [
-                "ffmpeg",
-                "-i", file_path,
-                "-c:a", "libmp3lame",
-                "-q:a", "4",  # Качество MP3 (0-9, где 0 лучшее)
-                converted_path
-            ]
-            subprocess.run(convert_cmd, capture_output=True)
             return [converted_path]
         
         # Определение количества сегментов
         num_segments = math.ceil(duration_sec / MAX_SEGMENT_LENGTH_SEC)
-        
         print(f"Длительность аудио: {duration_sec} сек, создание {num_segments} сегментов")
         
         # Создание сегментов
@@ -314,81 +338,32 @@ def split_audio_file(file_path: str) -> List[str]:
             segment_id = str(uuid.uuid4())
             segment_path = os.path.join(SEGMENTS_DIR, f"{segment_id}.mp3")
             
-            # Команда ffmpeg для вырезания сегмента с перекодированием
+            # Команда ffmpeg для вырезания сегмента
             cmd = [
                 "ffmpeg",
-                "-i", file_path,
+                "-i", converted_path,  # Используем уже конвертированный файл
                 "-ss", str(start_sec),
                 "-t", str(MAX_SEGMENT_LENGTH_SEC),
-                "-c:a", "libmp3lame",  # Перекодируем в MP3
-                "-q:a", "4",  # Качество MP3 (0-9, где 0 лучшее)
-                "-ar", "44100",  # Частота дискретизации
+                "-c:a", "libmp3lame",
+                "-q:a", "4",
+                "-ar", "44100",
                 segment_path
             ]
             
             # Выполнение команды
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            subprocess.run(cmd, capture_output=True)
             
             # Проверка размера созданного файла
             if os.path.exists(segment_path) and os.path.getsize(segment_path) > 0:
                 segment_paths.append(segment_path)
                 print(f"Создан сегмент {i+1}/{num_segments}: {segment_path}")
-            else:
-                print(f"Ошибка при создании сегмента {i+1}/{num_segments}: {result.stderr}")
-                # Если возникла ошибка, попробуем снова с другими параметрами
-                retry_cmd = [
-                    "ffmpeg",
-                    "-i", file_path,
-                    "-ss", str(start_sec),
-                    "-t", str(MAX_SEGMENT_LENGTH_SEC),
-                    "-c:a", "aac",  # Используем AAC кодек как альтернативу
-                    "-b:a", "128k",  # Битрейт
-                    "-ar", "44100",
-                    segment_path
-                ]
-                subprocess.run(retry_cmd, capture_output=True)
-                
-                if os.path.exists(segment_path) and os.path.getsize(segment_path) > 0:
-                    segment_paths.append(segment_path)
-                    print(f"Создан сегмент {i+1}/{num_segments} (повторная попытка): {segment_path}")
         
-        # Если не удалось создать сегменты, возвращаем исходный файл
-        if not segment_paths:
-            print("Не удалось создать сегменты, используем исходный файл")
-            # Конвертируем исходный файл в MP3
-            converted_path = os.path.join(AUDIO_FILES_DIR, f"{uuid.uuid4()}.mp3")
-            convert_cmd = [
-                "ffmpeg",
-                "-i", file_path,
-                "-c:a", "libmp3lame",
-                "-q:a", "4",
-                converted_path
-            ]
-            subprocess.run(convert_cmd, capture_output=True)
-            return [converted_path]
-        
-        return segment_paths
+        # Если не удалось создать сегменты, возвращаем конвертированный файл
+        return segment_paths if segment_paths else [converted_path]
     
     except Exception as e:
         print(f"Ошибка при разделении аудио: {e}")
-        # В случае ошибки конвертируем исходный файл в MP3
-        try:
-            converted_path = os.path.join(AUDIO_FILES_DIR, f"{uuid.uuid4()}.mp3")
-            convert_cmd = [
-                "ffmpeg",
-                "-i", file_path,
-                "-c:a", "libmp3lame",
-                "-q:a", "4",
-                converted_path
-            ]
-            subprocess.run(convert_cmd, capture_output=True)
-            if os.path.exists(converted_path) and os.path.getsize(converted_path) > 0:
-                return [converted_path]
-        except:
-            pass
-        
-        # Если все методы не сработали, возвращаем исходный файл
-        return [file_path]
+        return [file_path]  # В случае ошибки возвращаем исходный файл
 
 async def download_large_file(message: Message, file_id: str, save_path: str) -> Tuple[bool, str]:
     """
@@ -720,8 +695,28 @@ async def handle_language_selection(client, callback_query):
         
         # Проверяем существование файла и состояния
         if not file_path or not os.path.exists(file_path):
-            await callback_query.answer("Файл не найден, повторите загрузку")
-            await callback_query.message.edit_text("❌ Файл не найден или удален. Пожалуйста, загрузите файл заново.")
+            # Показываем всплывающее сообщение об ошибке
+            await callback_query.answer("Файл не найден, загрузите файл заново")
+            
+            # Получаем текущий промпт пользователя
+            current_prompt = get_user_prompt(username)
+            
+            # Создаем клавиатуру для главного меню
+            keyboard = [
+                [InlineKeyboardButton("❓ Помощь", callback_data="show_help")]
+            ]
+            
+            # Редактируем сообщение на главную страницу
+            await callback_query.message.edit_text(
+                "👋 Привет! Я бот для транскрипции аудио с возможностью обработки результата через ChatGPT.\n\n"
+                "📱 **Что я умею:**\n"
+                "• Автоматически определять язык аудио\n"
+                "• Переводить текст на разные языки\n"
+                "• Обрабатывать полученный текст через ChatGPT с вашим промптом\n\n"
+                "🎧 Отправьте мне голосовое сообщение или аудиофайл, чтобы начать.\n\n"
+                f"📝 **Ваш текущий промпт для ChatGPT:**\n`{current_prompt}`",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
             return
         
         # Обновляем состояние пользователя
@@ -773,19 +768,16 @@ async def handle_language_selection(client, callback_query):
             clear_state(username, "transcribing")
             clear_state(username, "file_path")
             clear_state(username, "language")
-            
+                
     except Exception as e:
-        logger.error(f"Ошибка при обработке выбора языка: {e}", exc_info=True)
-        await callback_query.message.reply(f"❌ Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, "cancel_transcription")
         
         # Очищаем состояние пользователя в случае ошибки
         username = callback_query.from_user.username or str(callback_query.from_user.id)
         clear_state(username, "transcribing")
         clear_state(username, "file_path")
         clear_state(username, "language")
-
-# Обновляем обработчик кнопок действий с транскрипцией
-# Обновляем обработчик кнопок действий с транскрипцией
+        
 @app.on_callback_query(filters.regex(r"^action_(.+)$"))
 async def handle_action_selection(client, callback_query):
     try:
@@ -796,10 +788,27 @@ async def handle_action_selection(client, callback_query):
         transcription = get_state(username).get("transcription")
         
         if not transcription:
-            await callback_query.answer("Транскрипция не найдена")
+            # Показываем всплывающее сообщение об ошибке
+            await callback_query.answer("Транскрипция не найдена, загрузите файл заново")
+            
+            # Получаем текущий промпт пользователя
+            current_prompt = get_user_prompt(username)
+            
+            # Создаем клавиатуру для главного меню
+            keyboard = [
+                [InlineKeyboardButton("❓ Помощь", callback_data="show_help")]
+            ]
+            
+            # Редактируем сообщение на главную страницу
             await callback_query.message.edit_text(
-                "❌ Транскрипция не найдена или устарела. Пожалуйста, загрузите файл заново.",
-                reply_markup=None
+                "👋 Привет! Я бот для транскрипции аудио с возможностью обработки результата через ChatGPT.\n\n"
+                "📱 **Что я умею:**\n"
+                "• Автоматически определять язык аудио\n"
+                "• Переводить текст на разные языки\n"
+                "• Обрабатывать полученный текст через ChatGPT с вашим промптом\n\n"
+                "🎧 Отправьте мне голосовое сообщение или аудиофайл, чтобы начать.\n\n"
+                f"📝 **Ваш текущий промпт для ChatGPT:**\n`{current_prompt}`",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
         
@@ -873,8 +882,7 @@ async def handle_action_selection(client, callback_query):
             )
             
     except Exception as e:
-        logger.error(f"Ошибка при обработке действия: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, "back_to_actions")
         
         # В случае ошибки добавляем кнопку для возврата
         await callback_query.message.edit_text(
@@ -1168,8 +1176,7 @@ async def change_prompt_callback(client, callback_query):
         await callback_query.answer("Открываю управление промптами")
         
     except Exception as e:
-        logger.error(f"Ошибка при обработке изменения промпта: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, "back_to_gpt_prompt")
 
 
 @app.on_callback_query(filters.regex(r"^input_new_prompt$"))
@@ -1198,8 +1205,7 @@ async def input_new_prompt_callback(client, callback_query):
         await callback_query.answer("Введите новый промпт")
         
     except Exception as e:
-        logger.error(f"Ошибка при вводе нового промпта: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, "back_to_gpt_prompt")
 
 # Добавляем новый обработчик для возврата к промпту ChatGPT
 @app.on_callback_query(filters.regex(r"^back_to_gpt_prompt$"))
@@ -1240,8 +1246,7 @@ async def back_to_gpt_prompt(client, callback_query):
         await callback_query.answer("Вернулся к настройкам обработки")
         
     except Exception as e:
-        logger.error(f"Ошибка при возврате к настройкам обработки: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, "back_to_actions")
         
         # В случае ошибки возвращаемся к основному меню
         await back_to_actions_callback(client, callback_query)
@@ -1283,8 +1288,7 @@ async def select_prompt_callback(client, callback_query):
             await callback_query.answer("Промпт не найден")
             
     except Exception as e:
-        logger.error(f"Ошибка при выборе промпта: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, "back_to_gpt_prompt")
 
 @app.on_callback_query(filters.regex(r"^reset_prompt$"))
 async def reset_prompt_callback(client, callback_query):
@@ -1315,8 +1319,7 @@ async def reset_prompt_callback(client, callback_query):
         await callback_query.answer("Промпт сброшен к стандартному")
         
     except Exception as e:
-        logger.error(f"Ошибка при сбросе промпта: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, "back_to_gpt_prompt")
 
 # Найдите и удалите одну из двух функций handle_text, оставив только эту обновленную версию:
 
@@ -1402,8 +1405,7 @@ async def show_help_callback(client, callback_query):
         await callback_query.answer("Открываю справку")
         
     except Exception as e:
-        logger.error(f"Ошибка при показе справки: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, "back_to_main")
 
 # Обработчик для кнопки "Назад"
 @app.on_callback_query(filters.regex(r"^back_to_main$"))
@@ -1435,8 +1437,7 @@ async def back_to_main_callback(client, callback_query):
         await callback_query.answer("Возвращаюсь в главное меню")
         
     except Exception as e:
-        logger.error(f"Ошибка при возврате в главное меню: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, None)
         
 @app.on_callback_query(filters.regex(r"^back_to_language$"))
 async def back_to_language_callback(client, callback_query):
@@ -1445,9 +1446,27 @@ async def back_to_language_callback(client, callback_query):
         file_path = get_state(username).get("file_path")
         
         if not file_path or not os.path.exists(file_path):
-            await callback_query.answer("Файл не найден, начните заново")
+            # Показываем всплывающее сообщение об ошибке
+            await callback_query.answer("Файл не найден, загрузите файл заново")
+            
+            # Получаем текущий промпт пользователя
+            current_prompt = get_user_prompt(username)
+            
+            # Создаем клавиатуру для главного меню
+            keyboard = [
+                [InlineKeyboardButton("❓ Помощь", callback_data="show_help")]
+            ]
+            
+            # Редактируем сообщение на главную страницу
             await callback_query.message.edit_text(
-                "❌ Файл не найден или удален. Пожалуйста, загрузите файл заново."
+                "👋 Привет! Я бот для транскрипции аудио с возможностью обработки результата через ChatGPT.\n\n"
+                "📱 **Что я умею:**\n"
+                "• Автоматически определять язык аудио\n"
+                "• Переводить текст на разные языки\n"
+                "• Обрабатывать полученный текст через ChatGPT с вашим промптом\n\n"
+                "🎧 Отправьте мне голосовое сообщение или аудиофайл, чтобы начать.\n\n"
+                f"📝 **Ваш текущий промпт для ChatGPT:**\n`{current_prompt}`",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
             
@@ -1481,8 +1500,7 @@ async def back_to_language_callback(client, callback_query):
         await callback_query.answer("Возвращаюсь к выбору языка")
         
     except Exception as e:
-        logger.error(f"Ошибка при возврате к выбору языка: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, "cancel_transcription")
     
 @app.on_callback_query(filters.regex(r"^cancel_transcription$"))
 async def cancel_transcription_callback(client, callback_query):
@@ -1504,8 +1522,7 @@ async def cancel_transcription_callback(client, callback_query):
         await callback_query.answer("Транскрипция отменена")
         
     except Exception as e:
-        logger.error(f"Ошибка при отмене транскрипции: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, None)
 
 @app.on_callback_query(filters.regex(r"^back_to_actions$"))
 async def back_to_actions_callback(client, callback_query):
@@ -1514,10 +1531,27 @@ async def back_to_actions_callback(client, callback_query):
         transcription = get_state(username).get("transcription")
         
         if not transcription:
-            await callback_query.answer("Транскрипция не найдена")
+            # Показываем всплывающее сообщение об ошибке
+            await callback_query.answer("Транскрипция не найдена, загрузите файл заново")
+            
+            # Получаем текущий промпт пользователя
+            current_prompt = get_user_prompt(username)
+            
+            # Создаем клавиатуру для главного меню
+            keyboard = [
+                [InlineKeyboardButton("❓ Помощь", callback_data="show_help")]
+            ]
+            
+            # Редактируем сообщение на главную страницу
             await callback_query.message.edit_text(
-                "❌ Транскрипция не найдена или устарела. Пожалуйста, загрузите файл заново.",
-                reply_markup=None
+                "👋 Привет! Я бот для транскрипции аудио с возможностью обработки результата через ChatGPT.\n\n"
+                "📱 **Что я умею:**\n"
+                "• Автоматически определять язык аудио\n"
+                "• Переводить текст на разные языки\n"
+                "• Обрабатывать полученный текст через ChatGPT с вашим промптом\n\n"
+                "🎧 Отправьте мне голосовое сообщение или аудиофайл, чтобы начать.\n\n"
+                f"📝 **Ваш текущий промпт для ChatGPT:**\n`{current_prompt}`",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
         
@@ -1539,19 +1573,33 @@ async def back_to_actions_callback(client, callback_query):
         await callback_query.answer("Возвращаюсь к выбору действий")
         
     except Exception as e:
-        logger.error(f"Ошибка при возврате к выбору действий: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        await handle_callback_error(callback_query, e, "back_to_language")
 
-# Обработчик для навигации по страницам транскрипции
-@app.on_callback_query(filters.regex(r"^page_(prev|next|info)$"))
-async def handle_transcription_pagination(client, callback_query):
+@app.on_callback_query(filters.regex(r"^(gpt_)?page_(prev|next|info)$"))
+async def handle_pagination(client, callback_query):
     try:
         username = callback_query.from_user.username or str(callback_query.from_user.id)
-        action = callback_query.data.split("_")[1]
+        data_parts = callback_query.data.split("_")
+        
+        # Определяем тип пагинации (gpt или обычная)
+        is_gpt = len(data_parts) > 2 and data_parts[0] == "gpt"
+        action = data_parts[-1]  # prev, next или info
+        
+        # Получаем соответствующие данные из состояния
+        if is_gpt:
+            pages_key = "gpt_result_pages"
+            current_page_key = "current_gpt_page"
+            prefix = "gpt_page_"
+            title = "🧠 **Результат обработки ChatGPT**"
+        else:
+            pages_key = "transcription_pages"
+            current_page_key = "current_page"
+            prefix = "page_"
+            title = "📝 **Результат транскрипции**"
         
         # Получаем страницы и текущую страницу из состояния
-        pages = get_state(username).get("transcription_pages", [])
-        current_page = get_state(username).get("current_page", 0)
+        pages = get_state(username).get(pages_key, [])
+        current_page = get_state(username).get(current_page_key, 0)
         total_pages = len(pages)
         
         if not pages:
@@ -1560,23 +1608,20 @@ async def handle_transcription_pagination(client, callback_query):
             
         # Обрабатываем действие
         if action == "prev":
-            # Переходим на предыдущую страницу, если возможно
             if current_page > 0:
                 current_page -= 1
-                set_state(username, "current_page", current_page)
+                set_state(username, current_page_key, current_page)
             else:
                 await callback_query.answer("Вы уже на первой странице")
                 return
         elif action == "next":
-            # Переходим на следующую страницу, если возможно
             if current_page < total_pages - 1:
                 current_page += 1
-                set_state(username, "current_page", current_page)
+                set_state(username, current_page_key, current_page)
             else:
                 await callback_query.answer("Вы уже на последней странице")
                 return
         elif action == "info":
-            # Просто информационная кнопка, ничего не делаем
             await callback_query.answer(f"Страница {current_page + 1} из {total_pages}")
             return
             
@@ -1586,9 +1631,9 @@ async def handle_transcription_pagination(client, callback_query):
         # Если страниц больше одной, добавляем кнопки навигации
         if total_pages > 1:
             nav_buttons = []
-            nav_buttons.append(InlineKeyboardButton("◀️", callback_data="page_prev"))
-            nav_buttons.append(InlineKeyboardButton(f"{current_page + 1}/{total_pages}", callback_data="page_info"))
-            nav_buttons.append(InlineKeyboardButton("▶️", callback_data="page_next"))
+            nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"{prefix}prev"))
+            nav_buttons.append(InlineKeyboardButton(f"{current_page + 1}/{total_pages}", callback_data=f"{prefix}info"))
+            nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"{prefix}next"))
             keyboard.append(nav_buttons)
         
         # Добавляем кнопку "Назад"
@@ -1596,7 +1641,7 @@ async def handle_transcription_pagination(client, callback_query):
         
         # Обновляем сообщение с текущей страницей
         await callback_query.message.edit_text(
-            f"📝 **Результат транскрипции** (страница {current_page + 1}/{total_pages}):\n\n{pages[current_page]}",
+            f"{title} (страница {current_page + 1}/{total_pages}):\n\n{pages[current_page]}",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
@@ -1607,73 +1652,7 @@ async def handle_transcription_pagination(client, callback_query):
     except Exception as e:
         logger.error(f"Ошибка при навигации по страницам: {e}", exc_info=True)
         await callback_query.answer(f"Произошла ошибка: {str(e)}")
-
-# Обработчик для навигации по страницам результата ChatGPT
-@app.on_callback_query(filters.regex(r"^gpt_page_(prev|next|info)$"))
-async def handle_gpt_pagination(client, callback_query):
-    try:
-        username = callback_query.from_user.username or str(callback_query.from_user.id)
-        action = callback_query.data.split("_")[2]
         
-        # Получаем страницы и текущую страницу из состояния
-        pages = get_state(username).get("gpt_result_pages", [])
-        current_page = get_state(username).get("current_gpt_page", 0)
-        total_pages = len(pages)
-        
-        if not pages:
-            await callback_query.answer("Информация о страницах не найдена")
-            return
-            
-        # Обрабатываем действие
-        if action == "prev":
-            # Переходим на предыдущую страницу, если возможно
-            if current_page > 0:
-                current_page -= 1
-                set_state(username, "current_gpt_page", current_page)
-            else:
-                await callback_query.answer("Вы уже на первой странице")
-                return
-        elif action == "next":
-            # Переходим на следующую страницу, если возможно
-            if current_page < total_pages - 1:
-                current_page += 1
-                set_state(username, "current_gpt_page", current_page)
-            else:
-                await callback_query.answer("Вы уже на последней странице")
-                return
-        elif action == "info":
-            # Просто информационная кнопка, ничего не делаем
-            await callback_query.answer(f"Страница {current_page + 1} из {total_pages}")
-            return
-            
-        # Создаем клавиатуру с навигацией
-        keyboard = []
-        
-        # Если страниц больше одной, добавляем кнопки навигации
-        if total_pages > 1:
-            nav_buttons = []
-            nav_buttons.append(InlineKeyboardButton("◀️", callback_data="gpt_page_prev"))
-            nav_buttons.append(InlineKeyboardButton(f"{current_page + 1}/{total_pages}", callback_data="gpt_page_info"))
-            nav_buttons.append(InlineKeyboardButton("▶️", callback_data="gpt_page_next"))
-            keyboard.append(nav_buttons)
-        
-        # Добавляем кнопку "Назад"
-        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_actions")])
-        
-        # Обновляем сообщение с текущей страницей
-        await callback_query.message.edit_text(
-            f"🧠 **Результат обработки ChatGPT** (страница {current_page + 1}/{total_pages}):\n\n{pages[current_page]}",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        
-        # Подтверждаем нажатие кнопки
-        if action != "info":
-            await callback_query.answer(f"Страница {current_page + 1} из {total_pages}")
-            
-    except Exception as e:
-        logger.error(f"Ошибка при навигации по страницам ChatGPT: {e}", exc_info=True)
-        await callback_query.answer(f"Произошла ошибка: {str(e)}")
-
 @app.on_callback_query(filters.regex(r"^confirm_gpt_process$"))
 async def confirm_gpt_process(client, callback_query):
     try:
@@ -1683,10 +1662,27 @@ async def confirm_gpt_process(client, callback_query):
         transcription = get_state(username).get("pending_transcription")
         
         if not transcription:
-            await callback_query.answer("Транскрипция не найдена")
+            # Показываем всплывающее сообщение об ошибке
+            await callback_query.answer("Транскрипция не найдена, загрузите файл заново")
+            
+            # Получаем текущий промпт пользователя
+            current_prompt = get_user_prompt(username)
+            
+            # Создаем клавиатуру для главного меню
+            keyboard = [
+                [InlineKeyboardButton("❓ Помощь", callback_data="show_help")]
+            ]
+            
+            # Редактируем сообщение на главную страницу
             await callback_query.message.edit_text(
-                "❌ Транскрипция не найдена или устарела. Пожалуйста, загрузите файл заново.",
-                reply_markup=None
+                "👋 Привет! Я бот для транскрипции аудио с возможностью обработки результата через ChatGPT.\n\n"
+                "📱 **Что я умею:**\n"
+                "• Автоматически определять язык аудио\n"
+                "• Переводить текст на разные языки\n"
+                "• Обрабатывать полученный текст через ChatGPT с вашим промптом\n\n"
+                "🎧 Отправьте мне голосовое сообщение или аудиофайл, чтобы начать.\n\n"
+                f"📝 **Ваш текущий промпт для ChatGPT:**\n`{current_prompt}`",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
         
