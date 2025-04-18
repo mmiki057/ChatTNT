@@ -61,8 +61,11 @@ SUPPORTED_LANGUAGES = {
     "en": "Английский🇬🇧",
 }
 
-user_prompts = {}
 
+user_prompts = {} 
+user_current_prompts = {}  
+
+MAX_STORED_PROMPTS = 5
 user_states = {}
 
 def clean_cache():
@@ -264,11 +267,9 @@ async def transcribe_with_assemblyai(audio_path: str, message: Message, status_m
             status = response.json()["status"]
             
             if status == "completed":
-                # Получаем определенный язык из результата
                 detected_language = response.json().get("language_code", "неизвестен")
                 detected_lang_name = SUPPORTED_LANGUAGES.get(detected_language, detected_language)
                 
-                # Получаем текст транскрипции
                 transcription_text = response.json()["text"]
                 
                 await status_msg.edit_text(f"✅ Транскрипция завершена!\n"
@@ -282,7 +283,6 @@ async def transcribe_with_assemblyai(audio_path: str, message: Message, status_m
                 await status_msg.edit_text(f"❌ Ошибка при транскрипции: {error_msg}")
                 return False, f"Ошибка транскрипции: {error_msg}"
             
-            # Пауза перед следующей проверкой
             await asyncio.sleep(3)
     
     except Exception as e:
@@ -294,7 +294,6 @@ async def transcribe_with_assemblyai(audio_path: str, message: Message, status_m
         return False, f"Ошибка при транскрипции: {str(e)}"
     
     finally:
-        # Удаляем временные файлы
         try:
             if os.path.exists(audio_path):
                 os.remove(audio_path)
@@ -303,95 +302,116 @@ async def transcribe_with_assemblyai(audio_path: str, message: Message, status_m
             logger.error(f"Ошибка при удалении файла: {e}")
 
 async def process_with_chatgpt(text, prompt, message):
-    """
-    Обрабатывает текст через ChatGPT API с указанным промптом
-    """
-    status_msg = await message.reply("🧠 Обрабатываю текст с помощью ChatGPT...")
-    
     try:
         if not openai_client:
-            return "❌ Ошибка: API ключ OpenAI не настроен в конфигурации бота."
+            return False, "❌ Ошибка: API ключ OpenAI не настроен в конфигурации бота."
+        
+        messages = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": prompt}]
+            },
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": text}]
+            }
+        ]
+        
+        logger.info(f"Отправляю запрос в OpenAI с новым форматом")
         
         response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text}
-            ],
+            messages=messages,
             temperature=0.7,
             max_tokens=2000
         )
         
-        # Извлекаем текст ответа
         result = response.choices[0].message.content
-        await status_msg.edit_text("✅ Обработка через ChatGPT завершена!")
-        return result
+
+        return True, result
     
     except Exception as e:
         logger.error(f"Ошибка при вызове ChatGPT API: {e}", exc_info=True)
-        await status_msg.edit_text(f"❌ Ошибка при обработке текста: {str(e)}")
-        return f"Ошибка при обработке текста: {str(e)}"
+        return False, f"Ошибка при обработке текста: {str(e)}"
 
-# Показываем меню выбора языка
 async def show_language_selection(message: Message, file_path: str) -> None:
-    """
-    Показывает клавиатуру выбора языка для транскрипции
-    """
-    # Получаем username для хранения пути к файлу в состоянии
+
     username = message.from_user.username or str(message.from_user.id)
     
-    # Сохраняем путь к файлу в состоянии пользователя
     set_state(username, "file_path", file_path)
     
-    # Формируем клавиатуру с языками
     keyboard = []
     
-    # Добавляем языки для выбора
     for lang_code, lang_name in SUPPORTED_LANGUAGES.items():
         keyboard.append([
             InlineKeyboardButton(lang_name, callback_data=f"lang_{lang_code}")
         ])
     
-    # Добавляем кнопку отмены процесса
     keyboard.append([
         InlineKeyboardButton("🔙 Отмена", callback_data="cancel_transcription")
     ])
     
-    # Отправляем сообщение с клавиатурой
     await message.reply(
         "Выберите язык для транскрипции:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+def get_user_prompts(username):
+    """Получить список предыдущих промптов пользователя"""
+    return user_prompts.get(username, [])
+
+def add_user_prompt(username, prompt):
+    """Добавить новый промпт в историю пользователя"""
+    if username not in user_prompts:
+        user_prompts[username] = []
+    
+    # Проверяем, есть ли уже такой промпт в истории
+    if prompt in user_prompts[username]:
+        # Если есть - удаляем его, чтобы потом добавить в конец (как самый свежий)
+        user_prompts[username].remove(prompt)
+    
+    # Добавляем промпт в конец списка
+    user_prompts[username].append(prompt)
+    
+    # Ограничиваем количество хранимых промптов
+    if len(user_prompts[username]) > MAX_STORED_PROMPTS:
+        user_prompts[username] = user_prompts[username][-MAX_STORED_PROMPTS:]
+    
+    # Устанавливаем текущий промпт
+    user_current_prompts[username] = prompt
+
+def set_user_prompt(username, prompt):
+    """Установить текущий промпт пользователя"""
+    user_current_prompts[username] = prompt
+    # Также добавляем его в историю
+    add_user_prompt(username, prompt)
+
+def get_current_prompt(username):
+    """Получить текущий промпт пользователя"""
+    return user_current_prompts.get(username, "")
+
 @app.on_callback_query(filters.regex(r"^lang_(.+)$"))
 async def handle_language_selection(client, callback_query):
     try:
-        # Получаем код языка из callback_data
         language_code = callback_query.data.split("_")[1]
         
-        # Получаем username и путь к файлу из состояния
         username = callback_query.from_user.username or str(callback_query.from_user.id)
         file_path = get_state(username).get("file_path")
         
-        # Проверяем существование файла
         if not file_path or not os.path.exists(file_path):
             await callback_query.answer("Файл не найден, загрузите файл заново")
             return
         
-        # Обновляем состояние пользователя
         set_state(username, "language", language_code)
         
-        # Сообщаем, что язык выбран
         lang_name = SUPPORTED_LANGUAGES.get(language_code, "оригинальный")
         await callback_query.answer(f"Выбран язык: {lang_name}")
         
-        # Редактируем сообщение, убираем клавиатуру
         status_msg = await callback_query.message.edit_text(
             f"🔤 Выбран язык: {lang_name}\n⏳ Начинаю транскрипцию...",
             reply_markup=None
         )
         
-        # Запуск транскрипции с выбранным языком
         success, transcription = await transcribe_with_assemblyai(
             file_path, 
             callback_query.message, 
@@ -400,10 +420,8 @@ async def handle_language_selection(client, callback_query):
         )
         
         if success:
-            # Сохраняем транскрипцию в состоянии пользователя
             set_state(username, "transcription", transcription)
             
-            # Предлагаем пользователю выбор действий с транскрипцией
             keyboard = [
                 [InlineKeyboardButton("📝 Показать транскрипцию", callback_data="show_transcription")],
                 [InlineKeyboardButton("🧠 Обработать через ChatGPT", callback_data="process_gpt")],
@@ -417,17 +435,13 @@ async def handle_language_selection(client, callback_query):
             
             logger.info(f"Транскрипция успешно получена для {username}, длина: {len(transcription)} символов")
         else:
-            # В случае ошибки
             await callback_query.message.reply(f"❌ Не удалось выполнить транскрипцию: {transcription}")
             
-            # Очищаем состояние пользователя
             clear_state(username)
                 
     except Exception as e:
         logger.error(f"Ошибка при обработке выбора языка: {e}", exc_info=True)
         await callback_query.answer(f"Произошла ошибка: {str(e)}")
-        
-        # Очищаем состояние пользователя в случае ошибки
         username = callback_query.from_user.username or str(callback_query.from_user.id)
         clear_state(username)
 
@@ -436,26 +450,21 @@ async def show_transcription(client, callback_query):
     try:
         username = callback_query.from_user.username or str(callback_query.from_user.id)
         
-        # Получаем сохраненную транскрипцию
         transcription = get_state(username).get("transcription")
         
         if not transcription:
             await callback_query.answer("Транскрипция не найдена")
             return
         
-        # Разбиваем текст на страницы по 3000 символов
         page_size = 3000
         pages = [transcription[i:i+page_size] for i in range(0, len(transcription), page_size)]
         total_pages = len(pages)
         
-        # Сохраняем информацию о страницах
         set_state(username, "pages", pages)
         set_state(username, "current_page", 0)
         
-        # Создаем клавиатуру с навигацией
         keyboard = []
         
-        # Если страниц больше одной, добавляем кнопки навигации
         if total_pages > 1:
             nav_buttons = []
             nav_buttons.append(InlineKeyboardButton("◀️", callback_data="prev_page"))
@@ -463,10 +472,8 @@ async def show_transcription(client, callback_query):
             nav_buttons.append(InlineKeyboardButton("▶️", callback_data="next_page"))
             keyboard.append(nav_buttons)
         
-        # Добавляем кнопку "Назад"
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
         
-        # Показываем первую страницу
         await callback_query.message.edit_text(
             f"📝 **Результат транскрипции** (страница 1/{total_pages}):\n\n{pages[0]}",
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -493,7 +500,6 @@ async def navigate_pages(client, callback_query):
             await callback_query.answer("Информация о страницах не найдена")
             return
             
-        # Обрабатываем действие
         if action == "prev":
             if current_page > 0:
                 current_page -= 1
@@ -509,10 +515,8 @@ async def navigate_pages(client, callback_query):
                 await callback_query.answer("Вы уже на последней странице")
                 return
             
-        # Создаем клавиатуру с навигацией
         keyboard = []
         
-        # Если страниц больше одной, добавляем кнопки навигации
         if total_pages > 1:
             nav_buttons = []
             nav_buttons.append(InlineKeyboardButton("◀️", callback_data="prev_page"))
@@ -520,16 +524,13 @@ async def navigate_pages(client, callback_query):
             nav_buttons.append(InlineKeyboardButton("▶️", callback_data="next_page"))
             keyboard.append(nav_buttons)
         
-        # Добавляем кнопку "Назад"
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
         
-        # Обновляем сообщение с текущей страницей
         await callback_query.message.edit_text(
             f"📝 **Результат транскрипции** (страница {current_page + 1}/{total_pages}):\n\n{pages[current_page]}",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
-        # Подтверждаем нажатие кнопки
         await callback_query.answer(f"Страница {current_page + 1} из {total_pages}")
     
     except Exception as e:
@@ -541,7 +542,6 @@ async def page_info(client, callback_query):
     try:
         username = callback_query.from_user.username or str(callback_query.from_user.id)
         
-        # Получаем информацию о страницах
         pages = get_state(username).get("pages", [])
         current_page = get_state(username).get("current_page", 0)
         total_pages = len(pages)
@@ -556,14 +556,12 @@ async def process_gpt(client, callback_query):
     try:
         username = callback_query.from_user.username or str(callback_query.from_user.id)
         
-        # Получаем сохраненную транскрипцию
         transcription = get_state(username).get("transcription")
         
         if not transcription:
             await callback_query.answer("Транскрипция не найдена")
             return
             
-        # Проверяем настройку API ключа
         if not openai_client:
             await callback_query.answer("ChatGPT недоступен")
             await callback_query.message.edit_text(
@@ -598,31 +596,82 @@ async def process_gpt(client, callback_query):
         logger.error(f"Ошибка при подготовке к обработке через ChatGPT: {e}", exc_info=True)
         await callback_query.answer(f"Произошла ошибка: {str(e)}")
 
+def get_main_keyboard(username):
+    """Возвращает основную клавиатуру для обработки промптов"""
+    # Получаем текущий промпт пользователя
+    prompt = get_current_prompt(username)
+    
+    # Короткое отображение промпта (если он есть)
+    prompt_display = None
+    if prompt:
+        prompt_display = prompt[:25] + "..." if len(prompt) > 25 else prompt
+    
+    # Создаем клавиатуру
+    keyboard = [
+        [InlineKeyboardButton("✅ Отправить на обработку", callback_data="start_gpt_process")],
+        [InlineKeyboardButton("✏️ Изменить промпт", callback_data="change_prompt")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]
+    ]
+    
+    # Если есть текущий промпт, показываем его в первой строке
+    if prompt_display:
+        keyboard.insert(0, [InlineKeyboardButton(f"📝 Текущий промпт: {prompt_display}", callback_data="show_current_prompt")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
 @app.on_callback_query(filters.regex(r"^change_prompt$"))
 async def change_prompt(client, callback_query):
     try:
         username = callback_query.from_user.username or str(callback_query.from_user.id)
-        
-        # Устанавливаем флаг ожидания ввода промпта
         set_state(username, "awaiting_prompt", True)
+        previous_prompts = get_user_prompts(username)
+        keyboard = [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_gpt")]]
         
-        # Редактируем сообщение
+        for i, prompt in enumerate(previous_prompts):
+            display_prompt = (prompt[:40] + "...") if len(prompt) > 40 else prompt
+            keyboard.append([InlineKeyboardButton(f"📜 {display_prompt}", callback_data=f"use_prompt_{i}")])
+        
         await callback_query.message.edit_text(
             "📝 **Введите новый промпт**\n\n"
             "Отправьте текст вашего нового промпта в следующем сообщении.\n\n"
             "Примеры промптов:\n"
             "• `Суммируй этот текст кратко, выделяя ключевые моменты.`\n"
             "• `Преобразуй этот транскрипт в четкий конспект с заголовками.`\n"
-            "• `Извлеки из текста список действий и задач.`",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Отмена", callback_data="back_to_gpt")]
-            ])
+            "• `Извлеки из текста список действий и задач.`\n\n"
+            + (("Или выберите один из ваших предыдущих промптов:") if previous_prompts else ""),
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        
-        await callback_query.answer("Введите новый промпт")
-        
+        await callback_query.answer("Введите новый промпт" + (" или выберите из истории" if previous_prompts else ""))
     except Exception as e:
         logger.error(f"Ошибка при изменении промпта: {e}", exc_info=True)
+        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+
+@app.on_callback_query(filters.regex(r"^use_prompt_(\d+)$"))
+async def use_previous_prompt(client, callback_query):
+    try:
+        username = callback_query.from_user.username or str(callback_query.from_user.id)
+        prompt_index = int(callback_query.data.split("_")[-1])
+        
+        # Получаем промпты пользователя
+        previous_prompts = get_user_prompts(username)
+        
+        # Проверяем, что индекс в пределах списка
+        if 0 <= prompt_index < len(previous_prompts):
+            selected_prompt = previous_prompts[prompt_index]
+            
+            # Устанавливаем выбранный промпт как текущий
+            set_user_prompt(username, selected_prompt)
+            
+            # Возвращаемся к основному интерфейсу
+            await callback_query.message.edit_text(
+                f"✅ Промпт выбран:\n\n`{selected_prompt}`\n\nТеперь отправьте текст для обработки.",
+                reply_markup=get_main_keyboard(username)  # Предполагается, что у вас есть эта функция
+            )
+            await callback_query.answer("Промпт успешно выбран")
+        else:
+            await callback_query.answer("Промпт не найден")
+    except Exception as e:
+        logger.error(f"Ошибка при выборе предыдущего промпта: {e}", exc_info=True)
         await callback_query.answer(f"Произошла ошибка: {str(e)}")
 
 @app.on_callback_query(filters.regex(r"^start_gpt_process$"))
@@ -630,38 +679,41 @@ async def start_gpt_process(client, callback_query):
     try:
         username = callback_query.from_user.username or str(callback_query.from_user.id)
         
-        # Получаем сохраненную транскрипцию
-        transcription = get_state(username).get("transcription")
+        transcription = str(get_state(username).get("transcription"))
         
         if not transcription:
             await callback_query.answer("Транскрипция не найдена")
             return
             
-        # Получаем промпт пользователя
-        prompt = user_prompts.get(username, DEFAULT_PROMPT)
+        prompt = str(user_prompts.get(username, DEFAULT_PROMPT))
         
-        # Обновляем статус
-        await callback_query.message.edit_text(
+        status_msg = await callback_query.message.edit_text(
             "🧠 Обрабатываю текст с помощью ChatGPT...",
             reply_markup=None
         )
         
-        # Отправляем текст на обработку в ChatGPT
-        response = await process_with_chatgpt(transcription, prompt, callback_query.message)
+        success, response = await process_with_chatgpt(transcription, prompt, callback_query.message)
         
-        # Разбиваем результат на страницы
+        await status_msg.edit_text("✅ Обработка через ChatGPT завершена!")
+        
+        if not success:
+            await callback_query.message.reply(
+                f"❌ {response}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]
+                ])
+            )
+            return
+        
         page_size = 3000
         pages = [response[i:i+page_size] for i in range(0, len(response), page_size)]
         total_pages = len(pages)
         
-        # Сохраняем информацию о страницах
         set_state(username, "gpt_pages", pages)
         set_state(username, "current_gpt_page", 0)
         
-        # Создаем клавиатуру с навигацией
         keyboard = []
         
-        # Если страниц больше одной, добавляем кнопки навигации
         if total_pages > 1:
             nav_buttons = []
             nav_buttons.append(InlineKeyboardButton("◀️", callback_data="prev_gpt_page"))
@@ -669,12 +721,10 @@ async def start_gpt_process(client, callback_query):
             nav_buttons.append(InlineKeyboardButton("▶️", callback_data="next_gpt_page"))
             keyboard.append(nav_buttons)
         
-        # Добавляем кнопку "Назад"
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
         
-        # Показываем первую страницу результата
-        await callback_query.message.edit_text(
-            f"🧠 **Результат обработки ChatGPT** (страница 1/{total_pages}):\n\n{pages[0]}",
+        await callback_query.message.reply(
+            f"🧠 Страница 1/{total_pages}:\n\n{pages[0]}",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
@@ -682,7 +732,6 @@ async def start_gpt_process(client, callback_query):
         logger.error(f"Ошибка при обработке текста через ChatGPT: {e}", exc_info=True)
         await callback_query.answer(f"Произошла ошибка: {str(e)}")
         
-        # В случае ошибки добавляем кнопку для возврата
         await callback_query.message.edit_text(
             f"❌ Произошла ошибка при обработке текста: {str(e)}",
             reply_markup=InlineKeyboardMarkup([
@@ -829,15 +878,12 @@ async def cancel_transcription(client, callback_query):
 
 async def show_main_menu(client, message, username):
     """Показывает главное меню"""
-    # Получаем текущий промпт пользователя
     prompt = user_prompts.get(username, DEFAULT_PROMPT)
     
-    # Создаем клавиатуру для главного меню
     keyboard = [
         [InlineKeyboardButton("❓ Помощь", callback_data="show_help")]
     ]
     
-    # Отправляем или редактируем сообщение
     try:
         await message.edit_text(
             "👋 Привет! Я бот для транскрипции аудио с возможностью обработки результата через ChatGPT.\n\n"
@@ -849,7 +895,6 @@ async def show_main_menu(client, message, username):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     except Exception:
-        # Если не удалось отредактировать, отправляем новое сообщение
         await message.reply(
             "👋 Привет! Я бот для транскрипции аудио с возможностью обработки результата через ChatGPT.\n\n"
             "📱 **Что я умею:**\n"
@@ -863,15 +908,11 @@ async def show_main_menu(client, message, username):
 @app.on_callback_query(filters.regex(r"^show_help$"))
 async def show_help(client, callback_query):
     try:
-        # Собираем список языков для помощи
         languages_list = "\n".join([f"• {name}" for code, name in SUPPORTED_LANGUAGES.items()])
-        
-        # Создаем клавиатуру с кнопкой "Назад"
         keyboard = [
             [InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]
         ]
         
-        # Редактируем текущее сообщение
         await callback_query.message.edit_text(
             "📋 **Как пользоваться этим ботом:**\n\n"
             "1. Отправьте голосовое сообщение или аудиофайл (MP3, OGG, WAV и др.)\n"
@@ -900,7 +941,6 @@ async def start_command(client, message):
 
 @app.on_message(filters.command("help"))
 async def help_command(client, message):
-    # Собираем список языков для помощи
     languages_list = "\n".join([f"• {name}" for code, name in SUPPORTED_LANGUAGES.items()])
     
     await message.reply(
@@ -917,23 +957,16 @@ async def help_command(client, message):
 
 @app.on_message(filters.text)
 async def handle_text(client, message):
-    # Пропускаем сообщения с командами
     if message.text.startswith('/'):
         return
     
-    # Получаем username
     username = message.from_user.username or str(message.from_user.id)
     
-    # Проверяем, ожидается ли ввод промпта
     if get_state(username).get("awaiting_prompt", False):
-        # Сохраняем новый промпт
         new_prompt = message.text
-        user_prompts[username] = new_prompt
-        
-        # Сбрасываем флаг ожидания промпта
+        add_user_prompt(username, new_prompt)
         set_state(username, "awaiting_prompt", False)
-        
-        # Отправляем подтверждение с кнопкой возврата
+
         await message.reply(
             f"✅ Ваш промпт успешно сохранен!\n\n"
             f"📝 **Новый промпт:**\n`{new_prompt}`",
@@ -943,7 +976,6 @@ async def handle_text(client, message):
         )
         return
     
-    # Если не ожидается ввод промпта, отправляем стандартное сообщение
     await message.reply(
         "Пожалуйста, отправьте мне голосовое сообщение или аудиофайл для транскрипции.\n"
         "Используйте /help для получения справки."
@@ -955,15 +987,12 @@ async def handle_audio(client, message):
     try:
         username = message.from_user.username or str(message.from_user.id)
         
-        # Проверка если это не аудио-документ
         if message.document and not message.document.mime_type.startswith("audio/"):
-            # Проверяем расширение на наличие аудио-форматов
             file_ext = os.path.splitext(message.document.file_name)[1].lower() if message.document.file_name else ""
             if file_ext not in [".mp3", ".ogg", ".wav", ".flac", ".m4a", ".aac"]:
                 await message.reply("Этот документ не похож на аудиофайл. Отправьте аудиофайл для транскрипции.")
                 return
         
-        # Проверка активной транскрипции
         if get_state(username).get("transcribing", False):
             await message.reply(
                 "У вас уже есть активная задача транскрипции. "
@@ -971,10 +1000,8 @@ async def handle_audio(client, message):
             )
             return
         
-        # Установка статуса транскрипции
         set_state(username, "transcribing", True)
         
-        # Получение данных файла
         file_id = None
         file_name = None
         
@@ -991,7 +1018,6 @@ async def handle_audio(client, message):
             await message.reply("Пожалуйста, отправьте аудиофайл.")
             return
         
-        # Формирование уникального имени файла
         file_name = f"{int(time.time())}_{file_name}"
         save_path = os.path.join(AUDIO_FILES_DIR, file_name)
         
@@ -999,10 +1025,8 @@ async def handle_audio(client, message):
         success, result = await download_file(message, file_id, save_path)
         
         if success:
-            # Если скачивание успешно, предлагаем выбор языка
             await show_language_selection(message, save_path)
         else:
-            # Если скачивание не удалось, сообщаем об ошибке
             await message.reply(f"❌ Ошибка при скачивании файла: {result}")
             clear_state(username)
     
@@ -1011,7 +1035,6 @@ async def handle_audio(client, message):
         await message.reply(f"❌ Произошла ошибка при обработке аудиофайла: {str(e)}")
         clear_state(username)
 
-# Запуск бота
 if __name__ == "__main__":
     try:
         print("Запуск бота...")
@@ -1021,6 +1044,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Критическая ошибка: {e}")
     finally:
-        # Очищаем кэш при завершении
         clean_cache()
         print("Бот остановлен")
