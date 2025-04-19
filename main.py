@@ -390,6 +390,19 @@ def get_current_prompt(username):
     """Получить текущий промпт пользователя"""
     return user_current_prompts.get(username, "")
 
+def remove_user_prompt(username, index):
+    """Удалить промпт пользователя по индексу"""
+    if username in user_prompts and 0 <= index < len(user_prompts[username]):
+        removed_prompt = user_prompts[username].pop(index)
+        if username in user_current_prompts and user_current_prompts[username] == removed_prompt:
+            if user_prompts[username]:
+                user_current_prompts[username] = user_prompts[username][-1]
+            else:
+                user_current_prompts[username] = DEFAULT_PROMPT
+                
+        return True, removed_prompt
+    return False, None
+
 @app.on_callback_query(filters.regex(r"^lang_(.+)$"))
 async def handle_language_selection(client, callback_query):
     try:
@@ -627,6 +640,9 @@ async def change_prompt(client, callback_query):
         previous_prompts = get_user_prompts(username)
         keyboard = [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_gpt")]]
         
+        if previous_prompts:
+            keyboard.append([InlineKeyboardButton("🗑️ Управление промптами", callback_data="manage_prompts")])
+        
         for i, prompt in enumerate(previous_prompts):
             display_prompt = (prompt[:40] + "...") if len(prompt) > 40 else prompt
             keyboard.append([InlineKeyboardButton(f"📜 {display_prompt}", callback_data=f"use_prompt_{i}")])
@@ -674,6 +690,59 @@ async def use_previous_prompt(client, callback_query):
         logger.error(f"Ошибка при выборе предыдущего промпта: {e}", exc_info=True)
         await callback_query.answer(f"Произошла ошибка: {str(e)}")
 
+@app.on_callback_query(filters.regex(r"^manage_prompts$"))
+async def manage_prompts(client, callback_query):
+    try:
+        username = callback_query.from_user.username or str(callback_query.from_user.id)
+        previous_prompts = get_user_prompts(username)
+        
+        if not previous_prompts:
+            await callback_query.answer("У вас нет сохраненных промптов")
+            return
+        
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="change_prompt")]]
+        
+        for i, prompt in enumerate(previous_prompts):
+            display_prompt = (prompt[:30] + "...") if len(prompt) > 30 else prompt
+            # Добавляем строку с промптом и кнопкой удаления
+            keyboard.append([
+                InlineKeyboardButton(f"📜 {display_prompt}", callback_data=f"use_prompt_{i}"),
+                InlineKeyboardButton("🗑️ Удалить", callback_data=f"delete_prompt_{i}")
+            ])
+        
+        await callback_query.message.edit_text(
+            "🗑️ **Управление сохраненными промптами**\n\n"
+            "Выберите промпт для использования или удаления:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        await callback_query.answer("Выберите промпт для управления")
+    except Exception as e:
+        logger.error(f"Ошибка при управлении промптами: {e}", exc_info=True)
+        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+
+@app.on_callback_query(filters.regex(r"^delete_prompt_(\d+)$"))
+async def delete_prompt(client, callback_query):
+    try:
+        username = callback_query.from_user.username or str(callback_query.from_user.id)
+        prompt_index = int(callback_query.data.split("_")[-1])
+        
+        # Удаляем промпт
+        success, removed_prompt = remove_user_prompt(username, prompt_index)
+        
+        if success:
+            shortened_prompt = (removed_prompt[:20] + "...") if len(removed_prompt) > 20 else removed_prompt
+            await callback_query.answer(f"Промпт '{shortened_prompt}' удален")
+            
+            # Возвращаемся к управлению промптами
+            await manage_prompts(client, callback_query)
+        else:
+            await callback_query.answer("Промпт не найден")
+            
+    except Exception as e:
+        logger.error(f"Ошибка при удалении промпта: {e}", exc_info=True)
+        await callback_query.answer(f"Произошла ошибка: {str(e)}")
+        
 @app.on_callback_query(filters.regex(r"^start_gpt_process$"))
 async def start_gpt_process(client, callback_query):
     try:
